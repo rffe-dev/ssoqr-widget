@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PayNow QR (SSO Choral Programmes)</title>
+<style>
+  :root { --brand: #7c1a78; --ink: #1f1a22; --muted: #6b6470; --bad: #b3261e; --line: #e3dfe6; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #fff; color: var(--ink); font: 15px/1.45 "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif; }
+  #wrap { max-width: 420px; margin: 0 auto; padding: 8px 8px 12px; text-align: center; }
+  #qr { display: block; margin: 0 auto; width: 100%; max-width: var(--size, 280px); height: auto; image-rendering: pixelated; }
+  #details { margin-top: 8px; }
+  #amount { font-size: 22px; font-weight: 700; }
+  #meta { color: var(--muted); font-size: 13.5px; }
+  #hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  #save { margin-top: 10px; font: inherit; font-weight: 600; padding: 8px 14px; border-radius: 8px; border: 1px solid #c9c2cd; background: #fff; cursor: pointer; }
+  #save:hover { background: #f5f2f6; }
+  #message { padding: 14px; border-radius: 10px; background: #f7f5f8; color: var(--muted); }
+  #message.bad { background: #fdecea; color: #5c1410; }
+  #paste { display: none; margin-top: 10px; text-align: left; }
+  #paste textarea { width: 100%; height: 70px; font: 12px Consolas, Menlo, monospace; }
+  #debug { display: none; margin-top: 12px; text-align: left; font: 11.5px/1.4 Consolas, Menlo, monospace; background: #f4f2f5; border: 1px dashed #c9bfcc; border-radius: 8px; padding: 8px; white-space: pre-wrap; word-break: break-all; }
+  [hidden] { display: none !important; }
+</style>
+<!-- Jotform's widget library (lets this page talk to the form it sits in). -->
+<script src="https://js.jotform.com/JotFormCustomWidget.min.js"></script>
+<script src="qrcode.js"></script>
+<script src="jsQR.js"></script>
+</head>
+<body>
+<div id="wrap">
+  <div id="message">Your PayNow QR code will appear here once your details have loaded.</div>
+  <div id="shown" hidden>
+    <canvas id="qr" width="10" height="10" aria-label="PayNow QR code"></canvas>
+    <div id="details">
+      <div id="amount"></div>
+      <div id="meta"></div>
+    </div>
+    <div id="hint">Scan with your banking app. The amount and reference are filled in automatically.<br>
+      On your phone? Save or screenshot this code, then choose <b>Scan QR</b> and pick it from your photos.</div>
+    <button id="save" type="button">Save QR code image</button>
+  </div>
+  <div id="paste">
+    <b>Standalone test</b> (this page isn't inside a Jotform form). Paste a payment text:
+    <textarea id="pasteBox" spellcheck="false"></textarea>
+  </div>
+  <div id="debug"></div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const VERSION = "0.1.0 (proof of concept)";
+  const $ = (id) => document.getElementById(id);
+  const log = [];
+  const params = new URLSearchParams(location.search);
+  const S = { settings: {}, payload: "", source: "", lastDrawn: "", jf: typeof JFCustomWidget !== "undefined" };
+
+  function dbg(msg) {
+    log.push(new Date().toISOString().slice(11, 19) + "  " + msg);
+    if (log.length > 60) log.shift();
+    if (setting("debug") === "1" || setting("debug") === "yes") {
+      $("debug").style.display = "block";
+      $("debug").textContent = "PayNow QR widget " + VERSION + "\n" + log.join("\n");
+      resize();
+    }
+  }
+
+  // Settings come from Jotform's widget settings, or from the page address when testing.
+  function setting(name) {
+    const v = S.settings[name] != null && S.settings[name] !== "" ? S.settings[name] : params.get(name);
+    return v == null ? "" : String(v).trim();
+  }
+
+  // ---------------------------------------------------------------- checking the payment text
+  function crc16(data) {
+    let crc = 0xFFFF;
+    for (let i = 0; i < data.length; i++) {
+      crc ^= data.charCodeAt(i) << 8;
+      for (let b = 0; b < 8; b++) { crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1); crc &= 0xFFFF; }
+    }
+    return crc.toString(16).toUpperCase().padStart(4, "0");
+  }
+  function tlv(s) {
+    const out = {};
+    let i = 0;
+    while (i + 4 <= s.length) {
+      const tag = s.slice(i, i + 2), len = parseInt(s.slice(i + 2, i + 4), 10);
+      if (!/^\d{2}$/.test(s.slice(i + 2, i + 4)) || i + 4 + len > s.length) return null;
+      out[tag] = s.slice(i + 4, i + 4 + len);
+      i += 4 + len;
+    }
+    return i === s.length ? out : null;
+  }
+  // Returns {ok, reason, amount, reference, payee, expiry}
+  function inspect(payload) {
+    const p = (payload || "").trim();
+    if (!p) return { ok: false, reason: "empty" };
+    if (!/^[\x20-\x7E]+$/.test(p) || !p.startsWith("000201") || p.length < 30) return { ok: false, reason: "not a PayNow payment text" };
+    if (p.slice(-8, -4) !== "6304" || crc16(p.slice(0, -4)) !== p.slice(-4).toUpperCase()) return { ok: false, reason: "checksum does not match (the text was changed)" };
+    const top = tlv(p);
+    if (!top || !top["26"]) return { ok: false, reason: "could not read the payment details" };
+    const mi = tlv(top["26"]);
+    if (!mi || mi["00"] !== "SG.PAYNOW") return { ok: false, reason: "not a PayNow code" };
+    const ref = top["62"] ? (tlv(top["62"]) || {})["01"] || "" : "";
+    const proxy = mi["02"] || "";
+    return {
+      ok: true, amount: top["54"] || "", reference: ref, expiry: mi["04"] || "", editable: mi["03"] === "1",
+      payee: mi["01"] === "0" ? "mobile " + proxy.slice(0, 3) + "****" + proxy.slice(-4) : "UEN " + proxy,
+      test: mi["01"] === "0",
+    };
+  }
+  function todayYmd() {
+    const d = new Date();
+    return d.getFullYear() + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
+  }
+
+  // ---------------------------------------------------------------- drawing
+  let logoImg = null, logoTried = false;
+  function loadLogo() {
+    const url = setting("logo");
+    if (!url || logoTried) return Promise.resolve(logoImg);
+    logoTried = true;
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => { logoImg = img; dbg("logo loaded: " + url); resolve(img); };
+      img.onerror = () => { dbg("logo could not load: " + url); resolve(null); };
+      img.src = url;
+    });
+  }
+
+  function draw(payload, info, logo) {
+    const color = /^#?[0-9A-Fa-f]{6}$/.test(setting("color")) ? "#" + setting("color").replace("#", "") : "#7C1A78";
+    const qr = qrcode(0, logo ? "H" : "M");
+    qr.addData(payload, "Byte");
+    qr.make();
+    const n = qr.getModuleCount(), box = 10, border = 4, size = (n + 2 * border) * box;
+    const c = $("qr");
+    c.width = size; c.height = size;
+    const g = c.getContext("2d", { willReadFrequently: true });
+    g.fillStyle = "#fff"; g.fillRect(0, 0, size, size);
+    g.fillStyle = color;
+    for (let r = 0; r < n; r++) for (let col = 0; col < n; col++) {
+      if (qr.isDark(r, col)) g.fillRect((col + border) * box, (r + border) * box, box, box);
+    }
+    if (logo) {                                // same sizing as the toolkit's PayNow tool
+      let padMod = Math.max(3, Math.round(n * 0.26));
+      if ((n - padMod) % 2) padMod += 1;
+      const padPx = padMod * box, o = (border + (n - padMod) / 2) * box, rad = Math.floor(padPx / 5);
+      g.fillStyle = "#fff";
+      g.beginPath();
+      g.moveTo(o + rad, o);
+      g.arcTo(o + padPx, o, o + padPx, o + padPx, rad); g.arcTo(o + padPx, o + padPx, o, o + padPx, rad);
+      g.arcTo(o, o + padPx, o, o, rad); g.arcTo(o, o, o + padPx, o, rad);
+      g.closePath(); g.fill();
+      const target = Math.floor(padPx * 0.78);
+      const s = Math.min(target / logo.width, target / logo.height);
+      const w = Math.max(1, Math.round(logo.width * s)), h = Math.max(1, Math.round(logo.height * s));
+      g.imageSmoothingQuality = "high";
+      g.drawImage(logo, o + Math.floor((padPx - w) / 2), o + Math.floor((padPx - h) / 2), w, h);
+    }
+    // Read the drawn code back; if it doesn't decode to exactly the payment text, don't show it.
+    try {
+      const img = g.getImageData(0, 0, size, size);
+      const res = jsQR(img.data, size, size, { inversionAttempts: "dontInvert" });
+      if (!res || res.data !== payload) {
+        if (logo) { dbg("read-back failed with logo; redrawing without it"); return draw(payload, info, null); }
+        return false;
+      }
+      dbg("read-back OK" + (logo ? " (with logo)" : ""));
+    } catch (e) {
+      dbg("read-back skipped: " + e.message + " (logo from another site?)");
+    }
+    return true;
+  }
+
+  async function show(payload, source) {
+    const p = (payload || "").trim();
+    if (p === S.lastDrawn) return;
+    const info = inspect(p);
+    dbg("payment text from " + source + ": " + (p ? p.slice(0, 24) + "... (" + p.length + " chars)" : "(empty)") +
+        " -> " + (info.ok ? "valid" : info.reason));
+    if (!info.ok) {
+      S.lastDrawn = p;
+      $("shown").hidden = true;
+      $("message").hidden = false;
+      $("message").className = p ? "bad" : "";
+      $("message").textContent = p
+        ? "Sorry, your PayNow QR code can't be shown. Please contact us so we can help you pay."
+        : "Your PayNow QR code will appear here once your details have loaded.";
+      sendValue("");
+      resize();
+      return;
+    }
+    if (info.expiry && info.expiry < todayYmd()) {
+      S.lastDrawn = p;
+      $("shown").hidden = true; $("message").hidden = false; $("message").className = "bad";
+      $("message").textContent = "This payment code expired on " + info.expiry.slice(6, 8) + "/" + info.expiry.slice(4, 6) + "/" + info.expiry.slice(0, 4) +
+        ". Please contact us for an updated payment code.";
+      sendValue("");
+      resize();
+      return;
+    }
+    const logo = await loadLogo();
+    if (!draw(p, info, logo)) {
+      S.lastDrawn = p;
+      $("shown").hidden = true; $("message").hidden = false; $("message").className = "bad";
+      $("message").textContent = "Sorry, your PayNow QR code can't be shown. Please contact us so we can help you pay.";
+      resize();
+      return;
+    }
+    S.lastDrawn = p;
+    const size = parseInt(setting("size"), 10);
+    if (size >= 160 && size <= 600) document.documentElement.style.setProperty("--size", size + "px");
+    const payeeLabel = setting("payeeName") || info.payee;
+    $("amount").textContent = info.amount ? "S$" + Number(info.amount).toLocaleString("en-SG", { minimumFractionDigits: 2 }) : "Amount entered in your banking app";
+    $("meta").textContent = "Pays " + payeeLabel + (info.reference ? " · Reference " + info.reference : "") +
+      (info.test ? " · TEST CODE" : "");
+    $("message").hidden = true;
+    $("shown").hidden = false;
+    sendValue((info.reference || "") + (info.amount ? " / S$" + info.amount : ""));
+    resize();
+  }
+
+  function sendValue(v) {
+    if (!S.jf) return;
+    try { JFCustomWidget.sendData({ value: v }); } catch (e) { /* ignore */ }
+  }
+  function resize() {
+    if (!S.jf) return;
+    requestAnimationFrame(() => {
+      try { JFCustomWidget.requestFrameResize({ height: document.body.scrollHeight + 6 }); } catch (e) { /* ignore */ }
+    });
+  }
+
+  // ---------------------------------------------------------------- getting the payment text from the form
+  // Jotform documents no official way for a widget to read another field, so we try the known
+  // possibilities and report which one worked (turn on the "debug" setting to see this).
+  function fieldRefs() {
+    const raw = setting("field");                 // e.g. "11" or "typeA11" or "paynow_payload"
+    const id = (raw.match(/(\d+)$/) || [])[1] || "";
+    return { raw, id };
+  }
+
+  function pick(resp) {
+    // Accept the different shapes a response might have.
+    try {
+      if (resp == null) return "";
+      if (typeof resp === "string") return resp;
+      const list = resp.data || resp.fields || resp;
+      if (Array.isArray(list)) {
+        for (const f of list) {
+          const v = f && (f.value != null ? f.value : f.answer);
+          if (v != null && String(v).trim()) return typeof v === "string" ? v : JSON.stringify(v);
+        }
+        return "";
+      }
+      if (typeof list === "object") {
+        for (const k of Object.keys(list)) {
+          const f = list[k];
+          const v = f && typeof f === "object" ? (f.value != null ? f.value : f.answer) : f;
+          if (v != null && String(v).trim()) return String(v);
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return "";
+  }
+
+  let pollTimer = 0, polls = 0, reported = false;
+  function fetchFromForm() {
+    const { raw, id } = fieldRefs();
+    const W = JFCustomWidget;
+    const tries = [];
+    if (id && typeof W.getFieldsValueById === "function") tries.push(["getFieldsValueById", () => new Promise((res) => W.getFieldsValueById([id], res))]);
+    if (raw && typeof W.getFieldsValueByName === "function") tries.push(["getFieldsValueByName", () => new Promise((res) => W.getFieldsValueByName([raw], res))]);
+    if (!tries.length && !reported) {
+      reported = true;
+      dbg("no field-reading method available. Methods present: " + Object.keys(W).filter((k) => typeof W[k] === "function").join(", "));
+    }
+    S.answered = false;
+    return tries.reduce((chain, [name, fn]) => chain.then(async (found) => {
+      if (found) return found;
+      const resp = await Promise.race([fn(), new Promise((r) => setTimeout(() => r("__timeout__"), 2500))]);
+      if (resp === "__timeout__") { if (polls < 2) dbg(name + ": no answer"); return ""; }
+      S.answered = true;
+      const v = pick(resp);
+      if (polls < 2 || v) dbg(name + "(" + (name.endsWith("Id") ? id : raw) + ") -> " + (v ? "value found" : "empty: " + JSON.stringify(resp).slice(0, 160)));
+      if (v) S.source = name;
+      return v;
+    }), Promise.resolve(""));
+  }
+
+  function startPolling() {
+    clearInterval(pollTimer);
+    const tick = async () => {
+      polls++;
+      try {
+        const v = await fetchFromForm();
+        if (v) show(v, S.source);
+        else if (S.answered && S.lastDrawn) show("", "form (field now empty)");
+      } catch (e) { if (polls < 3) dbg("read error: " + e.message); }
+    };
+    tick();
+    pollTimer = setInterval(tick, 2000);         // picks up the value after the lookup fills it in
+  }
+
+  // ---------------------------------------------------------------- start
+  $("save").addEventListener("click", () => {
+    try {
+      const a = document.createElement("a");
+      a.href = $("qr").toDataURL("image/png");
+      a.download = "PayNow-QR" + (S.lastDrawn ? "-" + (inspect(S.lastDrawn).reference || "code") : "") + ".png";
+      document.body.append(a); a.click(); a.remove();
+    } catch (e) {
+      $("save").textContent = "Press and hold the QR code to save it";
+    }
+  });
+
+  if (S.jf) {
+    JFCustomWidget.subscribe("ready", (data) => {
+      try { S.settings = JFCustomWidget.getWidgetSettings() || {}; } catch (e) { S.settings = {}; }
+      dbg("ready. formId=" + (data && data.formId) + ", own value=" + JSON.stringify(data && data.value) +
+          ", settings=" + JSON.stringify(S.settings));
+      dbg("library methods: " + Object.keys(JFCustomWidget).filter((k) => typeof JFCustomWidget[k] === "function").join(", "));
+      // Route 2: the payment text was copied into this widget's own value by a form condition.
+      if (data && data.value && inspect(data.value).ok) { S.source = "widget value"; show(data.value, "widget value"); }
+      if (fieldRefs().raw) startPolling();
+      else dbg("no 'field' setting given, so only the widget's own value can be used");
+      resize();
+    });
+  } else if (window.self === window.top) {
+    // Standalone testing (page opened directly): ?payload=... or paste box.
+    dbg("not inside Jotform (library not loaded)");
+    const p = params.get("payload");
+    $("paste").style.display = "block";
+    if (p) { $("pasteBox").value = p; show(p, "address bar"); }
+    $("pasteBox").addEventListener("input", () => show($("pasteBox").value, "paste box"));
+  } else {
+    dbg("inside a frame but Jotform's widget library did not load");
+    $("message").textContent = "Your PayNow QR code could not be loaded. Please refresh the page or contact us.";
+  }
+})();
+</script>
+</body>
+</html>
